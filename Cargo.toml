@@ -18,3 +18,7 @@ path = "src/smoke_test_0/main.rs"
 [[bin]]
 name = "prime_time"
 path = "src/prime_time_1/main.rs"
+
+[[bin]]
+name = "means_to_an_end"
+path = "src/means_to_an_end_2/main.rs"
