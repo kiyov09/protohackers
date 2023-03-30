@@ -22,3 +22,7 @@ path = "src/prime_time_1/main.rs"
 [[bin]]
 name = "means_to_an_end"
 path = "src/means_to_an_end_2/main.rs"
+
+[[bin]]
+name = "budget_chat"
+path = "src/budget_chat_3/main.rs"
