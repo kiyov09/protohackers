@@ -1,7 +1,15 @@
 use std::io::{prelude::*, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
+#[derive(Debug)]
+enum Action {
+    Join(User),
+    Disconnect(String),
+    SendMessage(String, String),
+}
+
+#[derive(Debug)]
 struct User {
     username: String,
     stream: TcpStream,
@@ -17,14 +25,29 @@ impl User {
     }
 }
 
-#[derive(Default)]
 struct ChatServer {
     users: Vec<User>,
+    receiver: Receiver<Action>,
 }
 
 impl ChatServer {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(rx: Receiver<Action>) -> Self {
+        Self {
+            users: Vec::new(),
+            receiver: rx,
+        }
+    }
+
+    pub fn run(&mut self) {
+        while let Ok(action) = self.receiver.recv() {
+            match action {
+                Action::Join(user) => self.add_user(user),
+                Action::Disconnect(username) => self.remove_user(username),
+                Action::SendMessage(username, message) => {
+                    self.send_message_from_user(&username, message)
+                }
+            }
+        }
     }
 
     pub fn add_user(&mut self, mut user: User) {
@@ -77,64 +100,84 @@ impl ChatServer {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, server: Arc<Mutex<ChatServer>>) {
+fn handle_connection(mut stream: TcpStream, sx: Sender<Action>) {
     let stream_clone = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     };
 
+    // Send the welcome message
     let welcome_message = "Welcome! Before continue, set your username:\n";
     stream.write_all(welcome_message.as_bytes()).unwrap();
 
+    // Prepare a buffer to read from the stream
     let mut reader = BufReader::new(&stream_clone);
     let mut buffer = String::new();
 
+    // Read the username from the stream
     if reader.read_line(&mut buffer).is_err() {
         return;
     }
 
+    // Check if the username is valid
     let username = buffer.trim().to_owned();
     if !User::is_valid_username(&username) {
         let invalid_username_message = "Invalid username! Try again.\n";
         stream
             .write_all(invalid_username_message.as_bytes())
-            .unwrap();
+            .expect("Failed to send message");
+
         return;
     }
     buffer.clear();
 
-    let new_user = User::new(username.clone(), stream_clone.try_clone().unwrap());
-    {
-        server.lock().unwrap().add_user(new_user);
-    }
+    // Create a new user and inform the server about it
+    let new_user = User::new(
+        username.clone(),
+        stream_clone.try_clone().expect("Failed to clone stream"),
+    );
+    sx.send(Action::Join(new_user))
+        .expect("Failed to add new user");
 
+    // Read messages from the user and send them to the server for broadcasting
     while let Ok(bytes_read) = reader.read_line(&mut buffer) {
+        // Close the connection if the user has closed the connection
         if bytes_read == 0 {
             println!("Connection closed!");
             break;
         }
 
-        server
-            .lock()
-            .unwrap()
-            .send_message_from_user(&username, buffer.clone());
+        // Send the message to the server
+        sx.send(Action::SendMessage(username.clone(), buffer.clone()))
+            .expect("Failed to send message");
 
         buffer.clear();
     }
 
-    server.lock().unwrap().remove_user(username);
+    // Inform the server that the user has disconnected
+    sx.send(Action::Disconnect(username))
+        .expect("Failed to inform other users");
 }
 
 fn main() -> std::io::Result<()> {
     let socket_add = SocketAddr::from(([0, 0, 0, 0], 5000));
     let listener = TcpListener::bind(socket_add).unwrap();
 
+    // Create a channel to communicate between the ChatServer and the
+    // therads that handle the connections
+    let (sd, rc) = channel::<Action>();
+
+    // Spawn a thread to run the ChatServer
+    std::thread::spawn(move || {
+        let mut server = ChatServer::new(rc);
+        server.run();
+    });
+
+    // Create a thread pool to handle the connections
     let thread_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(10)
         .build()
         .expect("Failed to build thread pool");
-
-    let chat_server: Arc<Mutex<ChatServer>> = Arc::new(Mutex::new(ChatServer::new()));
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -142,10 +185,13 @@ fn main() -> std::io::Result<()> {
             Err(_) => continue,
         };
 
-        let chat_server = Arc::clone(&chat_server);
+        // Clone the sender before moving it to the thread
+        let sd = sd.clone();
+
+        // Spawn a thread to handle the connection
         thread_pool.spawn(move || {
             println!("Connection established!");
-            handle_connection(stream, chat_server);
+            handle_connection(stream, sd);
         });
     }
 
