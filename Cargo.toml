@@ -26,3 +26,7 @@ path = "src/means_to_an_end_2/main.rs"
 [[bin]]
 name = "budget_chat"
 path = "src/budget_chat_3/main.rs"
+
+[[bin]]
+name = "unusual_db"
+path = "src/unusual_db_4/main.rs"
