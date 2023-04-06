@@ -30,3 +30,7 @@ path = "src/budget_chat_3/main.rs"
 [[bin]]
 name = "unusual_db"
 path = "src/unusual_db_4/main.rs"
+
+[[bin]]
+name = "mob_proxy"
+path = "src/mob_in_the_middle_5/main.rs"
