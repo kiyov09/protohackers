@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use rand::{thread_rng, Rng};
+use rand::Rng;
 
 type Road = u16;
 type Mile = u16;
