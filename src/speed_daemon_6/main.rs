@@ -31,11 +31,6 @@ impl Error {
         encode_str(&mut buffer, &self.msg);
         buffer
     }
-
-    fn from_bytes<T: Buf>(mut buf: T) -> Self {
-        let msg = decode_str(&mut buf);
-        Self { msg }
-    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -681,13 +676,6 @@ mod tests {
         let error = Error::new("bad");
         let expected = [0x03, 0x62, 0x61, 0x64];
         assert_eq!(error.to_bytes(), expected);
-    }
-
-    #[test]
-    fn error_from_bytes() {
-        let bytes = [0x03, 0x62, 0x61, 0x64];
-        let expected = Error::new("bad");
-        assert_eq!(Error::from_bytes(&bytes[..]), expected);
     }
 
     // Plate
