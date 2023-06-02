@@ -485,24 +485,16 @@ impl Server {
                 // Activity check
                 ServerMsg::Activity => self.handle_activity_check().await,
                 // Retransmission of data
-                ServerMsg::Retrans => {
-                    // TODO: Move this to its own method
-                    let now = Instant::now();
-                    for (sess, _) in self.sessions.values_mut() {
-                        for (_, (last, data)) in sess.send_data.iter() {
-                            if now.duration_since(*last).as_secs() > RETRY_TIMEOUT {
-                                data.send(sess.peer_addr, &self.socket)
-                                    .await
-                                    .expect("Failed to send data");
-                            }
-                        }
-                    }
-                }
+                ServerMsg::Retrans => self.handle_retransmission_check().await,
                 // Messages comming from the sessions (to send to the clients)
                 ServerMsg::ToClient(msg, addr) => match msg {
                     // A session will never send a connect message
                     Message::Connect(_) => unreachable!("Invalid message"),
                     Message::Data(data) => {
+                        if self.retrans_handler.is_none() {
+                            self.retrans_handler =
+                                Some(self.spawn_retrans(self.sender.clone()).await);
+                        }
                         data.send(addr, &self.socket).await.expect("Failed to send")
                     }
                     Message::Ack(ack) => {
@@ -547,6 +539,25 @@ impl Server {
         })
     }
 
+    async fn handle_activity_check(&mut self) {
+        let now = Instant::now();
+        let mut to_remove = Vec::new();
+
+        self.sessions.retain(|_, (sess, last)| {
+            if now.duration_since(*last).as_secs() > EXPIRE_TIMEOUT {
+                to_remove.push(sess.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        for sess in to_remove {
+            self.handle_close(Close { session: sess.id }, sess.peer_addr)
+                .await;
+        }
+    }
+
     async fn spawn_retrans(&mut self, sd: Sender<ServerMsg>) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -556,6 +567,20 @@ impl Server {
                     .expect("Failed to send retransmission check");
             }
         })
+    }
+
+    async fn handle_retransmission_check(&mut self) {
+        // TODO: Move this to its own method
+        let now = Instant::now();
+        for (sess, _) in self.sessions.values_mut() {
+            for (_, (last, data)) in sess.send_data.iter() {
+                if now.duration_since(*last).as_secs() > RETRY_TIMEOUT {
+                    data.send(sess.peer_addr, &self.socket)
+                        .await
+                        .expect("Failed to send data");
+                }
+            }
+        }
     }
 
     async fn handle_connect(&mut self, sess_id: usize, addr: SocketAddr) {
@@ -592,6 +617,9 @@ impl Server {
 
         if self.sessions.is_empty() {
             if let Some(handler) = self.activity_handler.take() {
+                handler.abort();
+            }
+            if let Some(handler) = self.retrans_handler.take() {
                 handler.abort();
             }
         }
@@ -632,26 +660,6 @@ impl Server {
 
         // Let the session handle the ack
         sess.handle_ack(ack).await
-    }
-
-    async fn handle_activity_check(&mut self) {
-        // TODO: Move this to its own method
-        let now = Instant::now();
-        let mut to_remove = Vec::new();
-
-        self.sessions.retain(|_, (sess, last)| {
-            if now.duration_since(*last).as_secs() > EXPIRE_TIMEOUT {
-                to_remove.push(sess.clone());
-                false
-            } else {
-                true
-            }
-        });
-
-        for sess in to_remove {
-            self.handle_close(Close { session: sess.id }, sess.peer_addr)
-                .await;
-        }
     }
 }
 
