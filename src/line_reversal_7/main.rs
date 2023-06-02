@@ -286,9 +286,9 @@ impl FromStr for Message {
 }
 
 /// Time to wait before resend a message to the client (in seconds)
-const RETRY_TIMEOUT: u64 = 5;
+const RETRY_TIMEOUT: u64 = 3;
 /// Time to wait before consider a session expired (in seconds)
-const EXPIRE_TIMEOUT: u64 = 10;
+const EXPIRE_TIMEOUT: u64 = 60;
 
 /// A client's session.
 #[derive(Debug, Clone)]
@@ -666,11 +666,11 @@ impl Server {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // For running locally
-    let socket_add = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
+    // let socket_add = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
 
     // For use with fly.io
     // See [here](https://fly.io/docs/app-guides/udp-and-tcp/) for more info
-    // let socket_add = "fly-global-services:5000";
+    let socket_add = "fly-global-services:5000";
 
     // Create the socket
     let sock = UdpSocket::bind(socket_add).await?;
