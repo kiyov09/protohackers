@@ -288,7 +288,7 @@ impl FromStr for Message {
 /// Time to wait before resend a message to the client (in seconds)
 const RETRY_TIMEOUT: u64 = 5;
 /// Time to wait before consider a session expired (in seconds)
-const EXPIRE_TIMEOUT: u64 = 30;
+const EXPIRE_TIMEOUT: u64 = 10;
 
 /// A client's session.
 #[derive(Debug, Clone)]
@@ -439,6 +439,10 @@ struct Server {
 
     // Udp socket to read messages from
     socket: Arc<UdpSocket>,
+
+    // Handlers for the threads
+    activity_handler: Option<JoinHandle<()>>,
+    retrans_handler: Option<JoinHandle<()>>,
 }
 
 impl Server {
@@ -451,6 +455,9 @@ impl Server {
             sender: sd,
             receiver: rc,
             socket: socket.into(),
+
+            activity_handler: None,
+            retrans_handler: None,
         }
     }
 
@@ -460,8 +467,8 @@ impl Server {
         // TODO:
         // I need to find a way to stop this threads when they have nothing to do
         // and respawn them when needed.
-        let _handler = self.spawn_activity(self.sender.clone()).await;
-        let _handler = self.spawn_retrans(self.sender.clone()).await;
+        // let _handler = self.spawn_activity(self.sender.clone()).await;
+        // let _handler = self.spawn_retrans(self.sender.clone()).await;
 
         // Spawn thread to handle incoming messages from clients
         self.spawn_socket(self.sender.clone()).await;
@@ -476,27 +483,7 @@ impl Server {
                     Message::Close(close) => self.handle_close(close, addr).await,
                 },
                 // Activity check
-                ServerMsg::Activity => {
-                    // TODO: Move this to its own method
-                    let now = Instant::now();
-                    let mut to_remove = Vec::new();
-
-                    self.sessions.retain(|_, (sess, last)| {
-                        if now.duration_since(*last).as_secs() > EXPIRE_TIMEOUT {
-                            to_remove.push(sess.clone());
-                            false
-                        } else {
-                            true
-                        }
-                    });
-
-                    for sess in to_remove {
-                        self.sessions.remove(&sess.id);
-                        let _ = Close { session: sess.id }
-                            .send(sess.peer_addr, &self.socket)
-                            .await;
-                    }
-                }
+                ServerMsg::Activity => self.handle_activity_check().await,
                 // Retransmission of data
                 ServerMsg::Retrans => {
                     // TODO: Move this to its own method
@@ -587,6 +574,10 @@ impl Server {
             .entry(sess_id)
             .or_insert((new_session, Instant::now()));
 
+        if self.activity_handler.is_none() {
+            self.activity_handler = Some(self.spawn_activity(self.sender.clone()).await);
+        }
+
         Ack {
             session: sess_id,
             length: 0,
@@ -598,6 +589,13 @@ impl Server {
 
     async fn handle_close(&mut self, close: Close, addr: SocketAddr) {
         self.sessions.remove(&close.session);
+
+        if self.sessions.is_empty() {
+            if let Some(handler) = self.activity_handler.take() {
+                handler.abort();
+            }
+        }
+
         close
             .send(addr, &self.socket)
             .await
@@ -635,16 +633,36 @@ impl Server {
         // Let the session handle the ack
         sess.handle_ack(ack).await
     }
+
+    async fn handle_activity_check(&mut self) {
+        // TODO: Move this to its own method
+        let now = Instant::now();
+        let mut to_remove = Vec::new();
+
+        self.sessions.retain(|_, (sess, last)| {
+            if now.duration_since(*last).as_secs() > EXPIRE_TIMEOUT {
+                to_remove.push(sess.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        for sess in to_remove {
+            self.handle_close(Close { session: sess.id }, sess.peer_addr)
+                .await;
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // For running locally
-    // let socket_add = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
+    let socket_add = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
 
     // For use with fly.io
     // See [here](https://fly.io/docs/app-guides/udp-and-tcp/) for more info
-    let socket_add = "fly-global-services:5000";
+    // let socket_add = "fly-global-services:5000";
 
     // Create the socket
     let sock = UdpSocket::bind(socket_add).await?;
