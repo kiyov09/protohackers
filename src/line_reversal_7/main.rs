@@ -96,7 +96,7 @@ impl Data {
         data[..last_nl]
             .lines()
             .map(|line| line.chars().rev().collect::<String>())
-            .map(|line| Self::escape(&line))
+            // .map(|line| Self::escape(&line))
             .map(|line| line + "\n")
             .collect::<String>()
     }
@@ -286,9 +286,9 @@ impl FromStr for Message {
 }
 
 /// Time to wait before resend a message to the client (in seconds)
-const RETRY_TIMEOUT: u64 = 3;
+const RETRY_TIMEOUT: u64 = 1;
 /// Time to wait before consider a session expired (in seconds)
-const EXPIRE_TIMEOUT: u64 = 60;
+const EXPIRE_TIMEOUT: u64 = 30;
 
 /// A client's session.
 #[derive(Debug, Clone)]
@@ -328,29 +328,15 @@ impl Session {
             let data_after_length = self.payload[ack.length..].to_string();
             let reversed_data = Data::process_for_response(&data_after_length);
 
-            // To be used as the marker for the next data to be sent
-            let mut pos = ack.length;
+            // Send data to client
+            let retrans_data = Data {
+                session: self.id,
+                pos: ack.length,
+                data: Data::escape(&reversed_data),
+            };
 
-            // Send message to client in chunks of 750 bytes
-            for chunk in reversed_data.chars().collect::<Vec<_>>().chunks(750) {
-                // Send data to client
-                let retrans_data = Data {
-                    session: self.id,
-                    pos,
-                    data: chunk.iter().collect(),
-                };
-
-                // Save for retransmission
-                pos += chunk.len();
-                self.send_data
-                    .insert(pos, (Instant::now(), retrans_data.clone()));
-                self.all_sent_pos.push(pos);
-
-                // Send to client
-                self.send(Message::Data(retrans_data.clone())).await;
-            }
-
-            return;
+            // Send to client
+            return self.send(Message::Data(retrans_data.clone())).await;
         }
 
         // Remove the data that was acked from the list of data to be retransmitted
@@ -391,12 +377,12 @@ impl Session {
         }
 
         // Send message to client in chunks of 750 bytes
-        for chunk in reversed_data.chars().collect::<Vec<_>>().chunks(750) {
+        for chunk in reversed_data.chars().collect::<Vec<_>>().chunks(900) {
             // Data for the client
             let data_for_client = Data {
                 session: self.id,
                 pos: self.curr_pos,
-                data: chunk.iter().collect(),
+                data: Data::escape(&chunk.iter().collect::<String>()),
             };
 
             // Save for retransmission
@@ -448,7 +434,7 @@ struct Server {
 impl Server {
     /// Creates a new server from a UdpSocket
     fn new(socket: UdpSocket) -> Self {
-        let (sd, rc) = channel::<ServerMsg>(100);
+        let (sd, rc) = channel::<ServerMsg>(100000);
 
         Self {
             sessions: HashMap::new(),
@@ -572,6 +558,7 @@ impl Server {
     async fn handle_retransmission_check(&mut self) {
         // TODO: Move this to its own method
         let now = Instant::now();
+
         for (sess, _) in self.sessions.values_mut() {
             for (_, (last, data)) in sess.send_data.iter() {
                 if now.duration_since(*last).as_secs() > RETRY_TIMEOUT {
