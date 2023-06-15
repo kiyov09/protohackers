@@ -7,10 +7,7 @@ use tokio::{
 };
 
 fn which_one_to_build(line: &str) -> &str {
-    line.lines()
-        .next()
-        .unwrap_or_default()
-        .split(',')
+    line.split(',')
         .max_by_key(|toy| toy.split_once('x').map(|(n, _)| n.parse::<u32>().unwrap()))
         .unwrap_or_default()
 }
