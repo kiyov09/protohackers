@@ -6,12 +6,14 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+/// Get the line of toys and return the toy with the largest volume
 fn which_one_to_build(line: &str) -> &str {
     line.split(',')
         .max_by_key(|toy| toy.split_once('x').map(|(n, _)| n.parse::<u32>().unwrap()))
         .unwrap_or_default()
 }
 
+/// Represents a cipher operation
 #[derive(Debug, PartialEq)]
 enum CipherOp {
     End,
@@ -23,6 +25,7 @@ enum CipherOp {
 }
 
 impl CipherOp {
+    /// Apply the cipher operation to the byte
     fn apply(&self, byte: &mut u8, pos: u8) {
         match self {
             CipherOp::End => (),
@@ -34,6 +37,9 @@ impl CipherOp {
         }
     }
 
+    /// Reverse the cipher operation to the byte
+    /// All operations are the same in reverse except for Add and AddPos
+    /// which are sub in reverse mode
     fn reverse(&self, byte: &mut u8, pos: u8) {
         match self {
             CipherOp::Add(x) => *byte = byte.wrapping_sub(*x),
@@ -43,6 +49,7 @@ impl CipherOp {
     }
 }
 
+/// Convert a byte to a cipher operation
 impl From<u8> for CipherOp {
     fn from(n: u8) -> Self {
         match n {
@@ -57,29 +64,43 @@ impl From<u8> for CipherOp {
     }
 }
 
+/// Represents a cipher specification
+/// A cipher spec is a list of cipher operations
 #[derive(Debug, PartialEq, Default)]
 struct CipherSpec {
     ops: Vec<CipherOp>,
 }
 
 impl CipherSpec {
-    async fn decode(&self, buf: &mut [u8], init_pos: u8) {
-        self.ops.iter().rev().for_each(|op| {
+    /// Apply the cipher spec to the buffer
+    async fn execute(
+        &self,
+        buf: &mut [u8],
+        init_pos: u8,
+        ops_iter: impl Iterator<Item = &CipherOp>,
+        fn_apply: impl Fn(&CipherOp, &mut u8, u8),
+    ) {
+        ops_iter.for_each(|op| {
             buf.iter_mut()
                 .enumerate()
-                .for_each(|(idx, v)| op.reverse(v, init_pos + idx as u8))
+                .for_each(|(idx, v)| fn_apply(op, v, init_pos + idx as u8))
         });
     }
 
+    /// Apply the cipher spec to the buffer in reverse mode
+    async fn decode(&self, buf: &mut [u8], init_pos: u8) {
+        self.execute(buf, init_pos, self.ops.iter().rev(), CipherOp::reverse)
+            .await;
+    }
+
+    /// Apply the cipher spec to the buffer in normal mode
     async fn encode(&mut self, buf: &mut [u8], init_pos: u8) {
-        self.ops.iter().for_each(|op| {
-            buf.iter_mut()
-                .enumerate()
-                .for_each(|(idx, v)| op.apply(v, init_pos + idx as u8))
-        });
+        self.execute(buf, init_pos, self.ops.iter(), CipherOp::apply)
+            .await;
     }
 }
 
+/// Convert a byte slice to a cipher spec
 impl From<&[u8]> for CipherSpec {
     fn from(value: &[u8]) -> Self {
         Self {
@@ -97,6 +118,11 @@ impl From<&[u8]> for CipherSpec {
     }
 }
 
+/// Represents a client session
+/// Each session begins with a cipher spec and then the client sends a requests
+/// Some ops in the cipher spec depends on the position of the byte in the request stream
+/// and doesn't reset to 0 after each request. This is true for both messages received and sent.
+/// Each stream has its own cursor.
 #[derive(Debug, Default)]
 struct Client {
     cipher_spec: CipherSpec,
@@ -105,6 +131,10 @@ struct Client {
 }
 
 impl Client {
+    /// Handle a client session
+    /// - Parse the cipher spec
+    /// - Validate the cipher spec
+    /// - In a loop, read the request, decode it, process it, encode it and send it back
     async fn run(&mut self, socket: TcpStream) {
         socket.readable().await.expect("socket is not readable");
 
@@ -116,21 +146,19 @@ impl Client {
             buffer.put_u8(byte);
             if byte == 0x00 {
                 self.cipher_spec = CipherSpec::from(&buffer[..]);
-                break;
+
+                match self.validate_cipher().await {
+                    Ok(_) => break,
+                    Err(_) => {
+                        eprintln!("Invalid cipher spec");
+                        return;
+                    }
+                }
             }
         }
         buffer.clear();
 
-        // Validate the cipher spec
-        if (self.validate_cipher().await).is_err() {
-            return;
-        } else {
-            self.recv_cursor = 0;
-            self.sent_cursor = 0;
-        }
-
         let mut request = String::new();
-
         loop {
             let bytes_read = reader
                 .read_buf(&mut buffer)
@@ -166,16 +194,20 @@ impl Client {
         }
     }
 
+    /// Process a line of data
     async fn process_data(&mut self, buf: &[u8]) -> Vec<u8> {
         let max_toy = which_one_to_build(std::str::from_utf8(buf).unwrap());
         self.encode(max_toy.as_bytes()).await
     }
 
+    /// Request the decoding of the buffer
     async fn decode(&mut self, buf: &mut [u8]) {
         self.cipher_spec.decode(buf, self.recv_cursor).await;
         self.recv_cursor += buf.len() as u8;
     }
 
+    /// Request the encoding of the buffer
+    /// This adds a newline at the end of the buffer
     async fn encode(&mut self, buf: &[u8]) -> Vec<u8> {
         let mut buf = buf.to_vec();
         buf.push(b'\n');
@@ -186,6 +218,7 @@ impl Client {
         buf
     }
 
+    /// Validate the cipher spec
     async fn validate_cipher(&mut self) -> Result<(), ()> {
         let test_data = b"Hello, world!\n";
         let mut to_decode = test_data.to_vec();
@@ -194,6 +227,10 @@ impl Client {
         if to_decode == test_data {
             return Err(());
         }
+
+        // Reset cursors
+        self.recv_cursor = 0;
+        self.sent_cursor = 0;
 
         Ok(())
     }
