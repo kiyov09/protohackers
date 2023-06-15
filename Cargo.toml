@@ -45,3 +45,7 @@ path = "src/speed_daemon_6/main.rs"
 [[bin]]
 name = "line"
 path = "src/line_reversal_7/main.rs"
+
+[[bin]]
+name = "insecure"
+path = "src/insecure_sockets_layer_8/main.rs"
