@@ -1,9 +1,9 @@
 use std::net::SocketAddr;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::{TcpListener, TcpStream},
+    net::{tcp::WriteHalf, TcpListener, TcpStream},
 };
 
 /// Get the line of toys and return the toy with the largest volume
@@ -165,7 +165,9 @@ impl Client {
         }
         buffer.clear();
 
-        let mut request = String::new();
+        // This cursor is user to keep track of the portion of the buffer that has been decoded
+        let mut cursor = 0;
+
         loop {
             let bytes_read = reader
                 .read_buf(&mut buffer)
@@ -177,34 +179,51 @@ impl Client {
                 break;
             }
 
-            // Decode the data and save it to the request string
-            self.decode(&mut buffer[..bytes_read]).await;
-            request.push_str(std::str::from_utf8(&buffer[..bytes_read]).unwrap());
+            // Decode the buffer from the last decoded position till the amount of bytes read
+            self.decode(&mut buffer[cursor..cursor + bytes_read]).await;
+            // Update the cursor
+            cursor += bytes_read;
 
-            // Clear the buffer for the next read
-            buffer.clear();
+            // Process the data
+            while buffer.contains(&b'\n') {
+                // Get the position of the first new line
+                let nl_pos = buffer
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .expect("We know it contains a new line");
 
-            // Process complete lines
-            while request.contains('\n') {
-                let (line, rest) = request.split_once('\n').unwrap();
-                let response = self.process_data(line.as_bytes()).await;
+                // Process the data in the buffer until the new line
+                let Ok(response) = self.process_data(&buffer[..nl_pos]).await else {
+                    eprintln!("Invalid UTF-8");
+                    break;
+                };
 
-                writer
-                    .write_all(&response)
-                    .await
-                    .expect("Cannot write to socket");
+                // Send the response to the client
+                Self::send_response(&mut writer, &response).await;
+                // Advance till the non processed data
+                buffer.advance(nl_pos + 1);
 
-                writer.flush().await.expect("Cannot flush socket");
-
-                request = rest.to_string();
+                // Update the cursor to be in the correct position
+                // for the next chunk of encoded data
+                cursor -= nl_pos + 1;
             }
         }
     }
 
+    async fn send_response(writer: &mut BufWriter<WriteHalf<'_>>, response: &[u8]) {
+        writer
+            .write_all(response)
+            .await
+            .expect("Cannot write to socket");
+
+        writer.flush().await.expect("Cannot flush socket");
+    }
+
     /// Process a line of data
-    async fn process_data(&mut self, buf: &[u8]) -> Vec<u8> {
-        let max_toy = which_one_to_build(std::str::from_utf8(buf).unwrap());
-        self.encode(max_toy.as_bytes()).await
+    async fn process_data(&mut self, buf: &[u8]) -> Result<Vec<u8>, std::str::Utf8Error> {
+        let as_str = std::str::from_utf8(buf)?;
+        let max_toy = which_one_to_build(as_str);
+        Ok(self.encode(max_toy.as_bytes()).await)
     }
 
     /// Request the decoding of the buffer
