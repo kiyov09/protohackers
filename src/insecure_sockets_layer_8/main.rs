@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use bytes::{BufMut, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
 };
 
@@ -135,15 +135,22 @@ impl Client {
     /// - Parse the cipher spec
     /// - Validate the cipher spec
     /// - In a loop, read the request, decode it, process it, encode it and send it back
-    async fn run(&mut self, socket: TcpStream) {
+    async fn run(&mut self, mut socket: TcpStream) {
         socket.readable().await.expect("socket is not readable");
 
-        let mut reader = BufWriter::new(socket);
+        let (reader, writer) = socket.split();
+
+        let mut reader = BufReader::new(reader);
+        let mut writer = BufWriter::new(writer);
+
+        // Buffer to read from client. According to the challenge description:
+        // "Clients won't send lines longer than 5000 characters."
         let mut buffer = BytesMut::with_capacity(5000);
 
         // Read the cipher spec
         while let Ok(byte) = reader.read_u8().await {
             buffer.put_u8(byte);
+
             if byte == 0x00 {
                 self.cipher_spec = CipherSpec::from(&buffer[..]);
 
@@ -182,12 +189,12 @@ impl Client {
                 let (line, rest) = request.split_once('\n').unwrap();
                 let response = self.process_data(line.as_bytes()).await;
 
-                reader
+                writer
                     .write_all(&response)
                     .await
                     .expect("Cannot write to socket");
 
-                reader.flush().await.expect("Cannot flush socket");
+                writer.flush().await.expect("Cannot flush socket");
 
                 request = rest.to_string();
             }
