@@ -13,6 +13,7 @@ rayon = "1.7.0"
 serde = { version = "1.0.158", features = ["derive"] }
 serde_json = "1.0.94"
 tokio = { version = "1.28.1", features = ["full"] }
+uuid = { version="1.4.1", features = ["v4", "serde"] }
 
 [[bin]]
 name = "smoke_test"
@@ -49,3 +50,7 @@ path = "src/line_reversal_7/main.rs"
 [[bin]]
 name = "insecure"
 path = "src/insecure_sockets_layer_8/main.rs"
+
+[[bin]]
+name = "job"
+path = "src/job_centre_9/main.rs"
