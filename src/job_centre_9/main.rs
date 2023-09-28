@@ -1,23 +1,20 @@
 use std::{
     collections::{BinaryHeap, HashMap, VecDeque},
     net::SocketAddr,
-    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::{TcpListener, TcpStream},
-    sync::{
-        mpsc::{channel, Sender},
-        Mutex,
-    },
+    net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
+    sync::mpsc::{self, channel},
 };
 
 use uuid::Uuid;
 
 type QueueName = String;
 type JobId = Uuid;
+type ClientId = Uuid;
 
 #[derive(Deserialize, Debug)]
 struct PutRequest {
@@ -133,16 +130,72 @@ impl PartialOrd for Job {
     }
 }
 
+#[derive(Debug)]
+enum CommandResult {
+    Queued(JobId),
+    Job(Job),
+    NoJob,
+    Ok,
+    Invalid(String),
+}
+
+#[derive(Debug)]
+enum Command {
+    Register(mpsc::Sender<CommandResult>),
+    Unregister,
+    Put(Job),
+    Get {
+        queues: Vec<QueueName>,
+        wait: Option<bool>,
+    },
+    Delete(JobId),
+    Abort(JobId),
+    // NOTE:
+    // We need to ensure responses are sent in the same order as the requests
+    // are received. This means any error we catch in the client need to be sent
+    // to the server so it can be sent back to the client in the correct order.
+    Error(String),
+}
+
+impl From<Request> for Command {
+    fn from(value: Request) -> Self {
+        match value {
+            Request::Put(req) => Command::Put(req.into()),
+            Request::Get(req) => Command::Get {
+                queues: req.queues,
+                wait: req.wait,
+            },
+            Request::Delete(req) => Command::Delete(req.id),
+            Request::Abort(req) => Command::Abort(req.id),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClientCommand {
+    id: ClientId,
+    command: Command,
+}
+
 struct Server {
+    tx: mpsc::Sender<ClientCommand>,
+    rx: mpsc::Receiver<ClientCommand>,
+
+    clients: HashMap<ClientId, mpsc::Sender<CommandResult>>,
     queues: HashMap<QueueName, BinaryHeap<Job>>,
-    jobs: HashMap<JobId, QueueName>, // Map a job_id to the name of the queue it's in
-    being_worked_on: Vec<Job>,
-    waiting_clients: HashMap<QueueName, VecDeque<Sender<Job>>>,
+    jobs: HashMap<JobId, QueueName>, // to find the queue of a job quickly
+    being_worked_on: Vec<(Job, ClientId)>, // to find the client working on a job quickly
+    waiting_clients: HashMap<QueueName, VecDeque<ClientId>>,
 }
 
 impl Server {
     fn new() -> Self {
+        let (tx, rx) = channel::<ClientCommand>(10);
+
         Server {
+            tx,
+            rx,
+            clients: HashMap::new(),
             queues: HashMap::new(),
             jobs: HashMap::new(),
             being_worked_on: Vec::new(),
@@ -150,9 +203,98 @@ impl Server {
         }
     }
 
-    async fn put(&mut self, job: Job) -> JobId {
-        // Only put the job in the queue if there's no client waiting
+    fn get_tx(&self) -> mpsc::Sender<ClientCommand> {
+        self.tx.clone()
+    }
 
+    async fn run(&mut self) {
+        while let Some(ClientCommand { id, command }) = self.rx.recv().await {
+            let result = match command {
+                Command::Unregister => {
+                    // If client is working on a job, abort it
+                    if let Some((job, _)) = self
+                        .being_worked_on
+                        .iter()
+                        .find(|(_, client_id)| client_id == &id)
+                    {
+                        let _ = self.abort(job.id).await;
+                    }
+
+                    // Remove the client
+                    self.clients.remove(&id);
+
+                    // Remove the client from any waiting queues
+                    for (_, clients) in self.waiting_clients.iter_mut() {
+                        clients.retain(|client_id| client_id != &id);
+                    }
+
+                    None
+                }
+                Command::Register(client_tx) => {
+                    // Register the client
+                    self.clients.insert(id, client_tx);
+                    None
+                }
+                Command::Put(job) => {
+                    // Add the job to the queue
+                    Some(self.put(job).await)
+                }
+                Command::Get { queues, wait } => {
+                    match self.get(queues.clone()).await {
+                        Ok(job) => {
+                            let client_tx = self.clients.get(&id);
+
+                            if let Some(tx) = client_tx {
+                                self.assign_to_client(id, job, tx.clone()).await;
+                            }
+
+                            None // assign_to_client already sends the response
+                        }
+                        Err(_) => match wait {
+                            Some(w) if w => {
+                                self.subscribe(queues, id);
+                                None
+                            }
+                            _ => Some(CommandResult::NoJob),
+                        },
+                    }
+                }
+                Command::Delete(job_id) => {
+                    // Delete the job
+                    Some(self.delete(job_id).await)
+                }
+                Command::Abort(job_id) => {
+                    // If Client is working on the job...
+                    let res = if self
+                        .being_worked_on
+                        .iter()
+                        .any(|(job, client_id)| job.id == job_id && client_id == &id)
+                    {
+                        // Abort the job
+                        self.abort(job_id).await
+                    } else {
+                        // Otherwise, return an error
+                        CommandResult::Invalid("Client not working on job".to_string())
+                    };
+
+                    Some(res)
+                }
+                Command::Error(msg) => Some(CommandResult::Invalid(msg)),
+            };
+
+            // Send response to client
+            if let Some(cmd_result) = result {
+                let tx = self
+                    .clients
+                    .get(&id)
+                    .expect("Something is very bad if client is not registered");
+                let _ = tx.send(cmd_result).await;
+            }
+        }
+    }
+
+    async fn put(&mut self, job: Job) -> CommandResult {
+        // Only put the job in the queue if there's no client waiting
         let id = job.id;
         let queue = job.queue.clone();
 
@@ -161,13 +303,17 @@ impl Server {
 
         // If there's a waiting client, send it to them
         if let Some(clients) = self.waiting_clients.get_mut(&queue) {
-            // TODO: This code it wrong, Why?
-            // - The client could have been disconnected
-            // - The client could have been subscribed to multiple queues
-            //   and had already received a job from another queue
-            if let Some(client) = clients.pop_front() {
-                let _ = client.send(job).await;
-                return id;
+            let client_info = clients
+                .pop_front()
+                .map(|client_id| (client_id, self.clients.get(&client_id)));
+
+            if let Some((client_id, tx)) = client_info {
+                let tx = tx.expect("We know for sure the client has a sender here");
+
+                self.assign_to_client(client_id, job.clone(), tx.clone())
+                    .await;
+
+                return CommandResult::Queued(id);
             }
         }
 
@@ -177,8 +323,8 @@ impl Server {
             .or_default()
             .push(job.clone());
 
-        // Return the id
-        id
+        // Inform it was queued
+        CommandResult::Queued(id)
     }
 
     async fn get(&mut self, queues: Vec<QueueName>) -> Result<Job, String> {
@@ -197,34 +343,15 @@ impl Server {
         }
 
         // Remove the job from the queue
-        let job = self.queues.get_mut(&queue).and_then(|q| q.pop());
-
-        // If there's a job, mark it as being worked on,
-        // and return it
-        if let Some(job) = job {
-            // Add it to the being_worked_on set
-            self.being_worked_on.push(job.clone());
-            // Return the job
-            Ok(job)
-        } else {
-            // Otherwise, return an error
-            Err("No job found".to_string())
-        }
+        self.queues
+            .get_mut(&queue)
+            .and_then(|q| q.pop())
+            .ok_or_else(|| "No job found".to_string())
     }
 
-    fn subscribe(&mut self, queues: Vec<QueueName>, tx: Sender<Job>) {
-        // Subscribe the client to jobs being put in the queues
-        for q in queues {
-            self.waiting_clients
-                .entry(q)
-                .or_default()
-                .push_back(tx.clone());
-        }
-    }
-
-    async fn delete(&mut self, id: JobId) -> Result<(), String> {
+    async fn delete(&mut self, id: JobId) -> CommandResult {
         // Remove the jobs from the set of ones being worked on
-        self.being_worked_on.retain(|job| job.id != id);
+        self.being_worked_on.retain(|(job, _)| job.id != id);
 
         // And remove it from the queue it's in too
         // If the job is not in the jobs map, it could means:
@@ -236,177 +363,152 @@ impl Server {
             .remove(&id)
             .and_then(|queue| self.queues.get_mut(&queue))
             .map_or_else(
-                || Err("Job not found".to_string()),
+                || CommandResult::NoJob,
                 |queue| {
                     // At this point, we know the job exists, so we can remove it from the queue
                     queue.retain(|job| job.id != id);
-                    Ok(())
+                    CommandResult::Ok
                 },
             )
     }
 
-    async fn abort(&mut self, id: JobId) -> Result<(), String> {
+    async fn abort(&mut self, id: JobId) -> CommandResult {
         // Get the position of the job in the being_worked_on vec
         // (if it's not there, return an error)
         let job_pos = self
             .being_worked_on
             .iter()
-            .position(|job| job.id == id)
-            .ok_or_else(|| "Job not found".to_string())?;
+            .position(|(job, _)| job.id == id);
+
+        if job_pos.is_none() {
+            return CommandResult::NoJob;
+        }
+        let job_pos = job_pos.expect("Already checked that job_pos is not None");
 
         // Remove the job from the being_worked_on vec
-        let job = self.being_worked_on.swap_remove(job_pos);
+        let (job, _) = self.being_worked_on.swap_remove(job_pos);
+
         // ... and put it back in the queue
         self.put(job).await;
 
         // Indicate success
-        Ok(())
+        CommandResult::Ok
+    }
+
+    fn subscribe(&mut self, queues: Vec<QueueName>, client_id: ClientId) {
+        // Subscribe the client to jobs being put in the queues
+        for q in queues {
+            self.waiting_clients
+                .entry(q)
+                .or_default()
+                .push_back(client_id);
+        }
+    }
+
+    async fn assign_to_client(
+        &mut self,
+        client_id: ClientId,
+        job: Job,
+        client_tx: mpsc::Sender<CommandResult>,
+    ) {
+        self.being_worked_on.push((job.clone(), client_id));
+        let _ = client_tx.send(CommandResult::Job(job.clone())).await;
     }
 }
 
 struct Client {
-    working_on: Option<JobId>,
-    server: Arc<Mutex<Server>>,
+    id: ClientId,
+    tx: mpsc::Sender<ClientCommand>,
 }
 
 impl Client {
-    fn new(server_ref: Arc<Mutex<Server>>) -> Self {
+    fn new(tx: mpsc::Sender<ClientCommand>) -> Self {
         Client {
-            working_on: None,
-            server: server_ref,
+            id: Uuid::new_v4(),
+            tx,
         }
     }
 
-    async fn run(&mut self, mut socket: TcpStream) {
+    async fn run(&mut self, socket: TcpStream) {
         socket.readable().await.expect("socket is not readable");
 
-        let (reader, writer) = socket.split();
+        let (reader, writer) = socket.into_split();
+        let (result_tx, rx) = mpsc::channel::<CommandResult>(100);
+
+        // Register the client with the server
+        let _ = self
+            .send_command(Command::Register(result_tx.clone()))
+            .await;
+
+        // Spawn task to receive messages from the server
+        self.spawn_receive_task(rx, writer).await;
 
         let mut reader = BufReader::new(reader);
-        let mut writer = BufWriter::new(writer);
-
         let mut buf = String::new();
 
         while let Ok(bytes_read) = reader.read_line(&mut buf).await {
             if bytes_read == 0 {
                 break;
             }
-
-            match serde_json::from_str::<Request>(&buf) {
-                Ok(req) => {
-                    let res = self.handle_request(req).await;
-                    let res = serde_json::to_string(&res).expect("Uups, my bad!");
-
-                    writer
-                        .write_all((res + "\n").as_bytes())
-                        .await
-                        .expect("Failed to write to socket");
-
-                    writer.flush().await.expect("Cannot flush socket");
-                }
-                Err(_e) => {
-                    let res = Response::Error {
-                        error: "Invalid request".to_string(),
-                    };
-                    let res = serde_json::to_string(&res).expect("Uups, my bad!");
-
-                    writer
-                        .write_all((res + "\n").as_bytes())
-                        .await
-                        .expect("Failed to write to socket");
-
-                    writer.flush().await.expect("Cannot flush socket");
-                }
-            }
-
+            self.handle_request(&buf).await;
             buf.clear();
         }
 
-        // Check if we were working on a job
-        // and if so, abort it without sending a response
-        if let Some(id) = self.working_on {
-            self.abort(AbortRequest { id }).await;
-        }
+        // Unregister the client from the server
+        let _ = self.send_command(Command::Unregister).await;
     }
 
-    async fn handle_request(&mut self, req: Request) -> Response {
-        match req {
-            Request::Put(req) => self.put(req).await,
-            Request::Get(req) => self.get(req).await,
-            Request::Delete(req) => self.delete(req).await,
-            Request::Abort(req) => self.abort(req).await,
-        }
-    }
+    async fn handle_request(&mut self, raw_request: &str) {
+        println!("--> Client {} send request: {}", self.id, raw_request);
 
-    async fn put(&self, req: PutRequest) -> Response {
-        let id = self.server.lock().await.put(req.into()).await;
-        Response::Ok(OkResponse::Id { id })
-    }
+        let cmd = serde_json::from_str::<Request>(raw_request)
+            .map(|req| req.into())
+            .unwrap_or_else(|_e| Command::Error("Invalid request".to_string()));
 
-    async fn get(&mut self, req: GetRequest) -> Response {
-        let job = self.server.lock().await.get(req.queues.clone()).await;
-
-        if let Ok(job) = job {
-            self.working_on = Some(job.id);
-            Response::Ok(OkResponse::Job(job))
-        } else {
-            match req.wait {
-                Some(w) if w => {
-                    let (tx, mut rx) = channel(10);
-
-                    self.server.lock().await.subscribe(req.queues.clone(), tx);
-
-                    match rx.recv().await {
-                        Some(j) => {
-                            self.working_on = Some(j.id);
-                            Response::Ok(OkResponse::Job(j))
-                        }
-                        None => Response::NoJob,
-                    }
-                }
-                _ => Response::NoJob,
-            }
-        }
-    }
-
-    async fn delete(&self, req: DeleteRequest) -> Response {
-        self.server
-            .lock()
+        self.send_command(cmd)
             .await
-            .delete(req.id)
-            .await
-            .map_or_else(|_| Response::NoJob, |_| Response::Ok(OkResponse::Empty))
+            .expect("Failed to send result to server");
     }
 
-    async fn abort(&mut self, req: AbortRequest) -> Response {
-        // Only the client working on a job can abort it, so
+    async fn spawn_receive_task(
+        &self,
+        mut rx: mpsc::Receiver<CommandResult>,
+        writer: OwnedWriteHalf,
+    ) {
+        // Handle responses from the server
+        tokio::spawn(async move {
+            let mut writer = BufWriter::new(writer);
 
-        // ... no job to abort, error
-        if self.working_on.is_none() {
-            return Response::Error {
-                error: "No job to abort".to_string(),
-            };
-        }
-
-        if let Some(id) = self.working_on {
-            // ... the job to abort is not the one the client is working on, error
-            if id != req.id {
-                return Response::Error {
-                    error: "Can't abort a job that you're not working on".to_string(),
+            while let Some(res) = rx.recv().await {
+                let res = match res {
+                    CommandResult::Ok => Response::Ok(OkResponse::Empty),
+                    CommandResult::Queued(id) => Response::Ok(OkResponse::Id { id }),
+                    CommandResult::Job(job) => Response::Ok(OkResponse::Job(job)),
+                    CommandResult::NoJob => Response::NoJob,
+                    CommandResult::Invalid(error) => Response::Error { error },
                 };
+                let res = serde_json::to_string(&res).expect("Uups, my bad!");
+
+                writer
+                    .write_all((res + "\n").as_bytes())
+                    .await
+                    .expect("Failed to write to socket");
+
+                writer.flush().await.expect("Cannot flush socket");
             }
-        }
+        });
+    }
 
-        // Take it out of the client's working_on field to leave a None in place
-        let job = self.working_on.take().unwrap();
-
-        // Use the sender end of the channel to send the request to the server
-        self.server
-            .lock()
+    async fn send_command(
+        &mut self,
+        command: Command,
+    ) -> Result<(), mpsc::error::SendError<ClientCommand>> {
+        self.tx
+            .send(ClientCommand {
+                id: self.id,
+                command,
+            })
             .await
-            .abort(job)
-            .await
-            .map_or_else(|_| Response::NoJob, |_| Response::Ok(OkResponse::Empty))
     }
 }
 
@@ -416,15 +518,20 @@ async fn main() {
     let socket_add = SocketAddr::from(([0, 0, 0, 0], 5000));
     let listener = TcpListener::bind(socket_add).await.unwrap();
 
-    let server = Arc::new(Mutex::new(Server::new()));
+    let mut server = Server::new();
+    let tx = server.get_tx();
+
+    tokio::spawn(async move {
+        server.run().await;
+    });
 
     loop {
         // The second item contains the IP and port of the new connection.
         let (socket, _) = listener.accept().await.unwrap();
-        let server = server.clone();
+        let tx = tx.clone();
 
         tokio::spawn(async move {
-            let mut client = Client::new(server);
+            let mut client = Client::new(tx);
             client.run(socket).await;
         });
     }
