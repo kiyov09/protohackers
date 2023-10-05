@@ -54,3 +54,7 @@ path = "src/insecure_sockets_layer_8/main.rs"
 [[bin]]
 name = "job"
 path = "src/job_centre_9/main.rs"
+
+[[bin]]
+name = "vcs"
+path = "src/voracious_code_storage_10/main.rs"
